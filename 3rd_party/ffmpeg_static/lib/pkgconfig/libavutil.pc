@@ -1,0 +1,14 @@
+prefix=/mingw64/ffmpeg_static
+exec_prefix=${prefix}
+libdir=/mingw64/ffmpeg_static/lib
+includedir=/mingw64/ffmpeg_static/include
+
+Name: libavutil
+Description: FFmpeg utility library
+Version: 60.13.100
+Requires: 
+Requires.private: 
+Conflicts:
+Libs: -L${libdir}  -lavutil -lm -luser32 -lbcrypt -latomic
+Libs.private: 
+Cflags: -I${includedir}

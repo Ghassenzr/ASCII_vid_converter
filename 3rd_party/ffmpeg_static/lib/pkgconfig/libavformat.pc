@@ -1,0 +1,14 @@
+prefix=/mingw64/ffmpeg_static
+exec_prefix=${prefix}
+libdir=/mingw64/ffmpeg_static/lib
+includedir=/mingw64/ffmpeg_static/include
+
+Name: libavformat
+Description: FFmpeg container format library
+Version: 62.6.101
+Requires: libavcodec >= 62.16.100, libswresample >= 6.2.100, libavutil >= 60.13.100
+Requires.private: 
+Conflicts:
+Libs: -L${libdir}  -lavformat -lm -latomic -lz -lsecur32 -lncrypt -lcrypt32 -lws2_32
+Libs.private: 
+Cflags: -I${includedir}

@@ -1,0 +1,281 @@
+cmake_minimum_required(VERSION 3.16)
+project(ASCII_Vid_Converter VERSION 0.1 LANGUAGES C CXX)
+
+# C++ Standard
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+# Build options
+option(USE_SYSTEM_FFMPEG "Use system-installed FFmpeg instead of bundled version" OFF)
+
+# Force static linking
+set(BUILD_SHARED_LIBS OFF)
+
+# Output directories
+if(NOT CMAKE_RUNTIME_OUTPUT_DIRECTORY)
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+endif()
+
+# ============================================================================
+# Find/Setup static FFmpeg
+# ============================================================================
+set(FFMPEG_ROOT "${CMAKE_SOURCE_DIR}/3rd_party/ffmpeg_static" CACHE PATH "Path to static FFmpeg")
+set(ZLIB_ROOT "${CMAKE_SOURCE_DIR}/3rd_party/zlib" CACHE PATH "Path to static zlib")
+
+if(USE_SYSTEM_FFMPEG)
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(FFMPEG REQUIRED libavformat libavcodec libavutil libswscale libswresample)
+        message(STATUS "Using system FFmpeg")
+    else()
+        message(FATAL_ERROR "pkg-config not found. Cannot locate system FFmpeg.")
+    endif()
+else()
+    # Use bundled static FFmpeg
+    set(FFMPEG_INCLUDE_DIR "${FFMPEG_ROOT}/include")
+    set(FFMPEG_LIB_DIR "${FFMPEG_ROOT}/lib")
+    
+    if(NOT EXISTS "${FFMPEG_INCLUDE_DIR}/libavformat/avformat.h")
+        message(FATAL_ERROR "Bundled FFmpeg not found at ${FFMPEG_ROOT}")
+    endif()
+    
+    message(STATUS "Using static FFmpeg at ${FFMPEG_ROOT}")
+    
+    # Find static FFmpeg libraries in correct order (dependencies matter for static linking)
+    set(FFMPEG_LIBS avformat avcodec swresample swscale avutil)
+    foreach(lib ${FFMPEG_LIBS})
+        find_library(FFMPEG_${lib}_LIBRARY
+            NAMES 
+                lib${lib}.a ${lib}.a      # Unix static libs
+                lib${lib}.lib ${lib}.lib  # Windows static libs
+            PATHS ${FFMPEG_LIB_DIR}
+            NO_DEFAULT_PATH
+            REQUIRED
+        )
+        list(APPEND FFMPEG_LIBRARIES ${FFMPEG_${lib}_LIBRARY})
+        message(STATUS "  Found ${lib}: ${FFMPEG_${lib}_LIBRARY}")
+    endforeach()
+    
+    set(FFMPEG_INCLUDE_DIRS ${FFMPEG_INCLUDE_DIR})
+endif()
+
+# ============================================================================
+# Find static zlib
+# ============================================================================
+if(EXISTS "${ZLIB_ROOT}")
+    set(ZLIB_INCLUDE_DIR "${ZLIB_ROOT}/include")
+    set(ZLIB_LIB_DIR "${ZLIB_ROOT}/lib")
+    
+    find_library(ZLIB_LIBRARY
+        NAMES 
+            libz.a z.a zlibstatic.lib        # Static lib names
+            libzlib.a zlib.a zlibstaticd.lib # Alternative names
+        PATHS ${ZLIB_LIB_DIR}
+        NO_DEFAULT_PATH
+    )
+    
+    if(ZLIB_LIBRARY)
+        message(STATUS "Using static zlib: ${ZLIB_LIBRARY}")
+        list(APPEND FFMPEG_LIBRARIES ${ZLIB_LIBRARY})
+        list(APPEND EXTRA_INCLUDE_DIRS ${ZLIB_INCLUDE_DIR})
+    else()
+        message(STATUS "Static zlib not found in ${ZLIB_ROOT}, trying system")
+    endif()
+endif()
+
+# Fallback to system zlib if bundled not found
+if(NOT ZLIB_LIBRARY)
+    if(WIN32 OR MINGW)
+        find_library(ZLIB_LIBRARY NAMES z zlib zdll)
+    else()
+        find_library(ZLIB_LIBRARY NAMES z)
+    endif()
+    
+    if(ZLIB_LIBRARY)
+        message(STATUS "Using system zlib: ${ZLIB_LIBRARY}")
+        list(APPEND FFMPEG_LIBRARIES ${ZLIB_LIBRARY})
+    else()
+        message(WARNING "zlib not found - may cause linking issues")
+    endif()
+endif()
+
+# ============================================================================
+# Find libiconv (required by FFmpeg)
+# ============================================================================
+if(WIN32)
+    find_library(ICONV_LIBRARY NAMES iconv libiconv)
+    if(ICONV_LIBRARY)
+        message(STATUS "Found libiconv: ${ICONV_LIBRARY}")
+        list(APPEND FFMPEG_LIBRARIES ${ICONV_LIBRARY})
+    else()
+        message(WARNING "libiconv not found - FFmpeg may fail to link")
+    endif()
+endif()
+
+# ============================================================================
+# Platform-specific system libraries
+# ============================================================================
+if(WIN32)
+    # Windows dependencies for FFmpeg
+    list(APPEND FFMPEG_LIBRARIES 
+        ws2_32      # Windows sockets
+        secur32     # Security API
+        bcrypt      # Cryptography
+        crypt32     # Cryptography API (for certificates)
+        ncrypt      # CNG (Cryptography Next Generation)
+        mfplat      # Media Foundation (if using hardware acceleration)
+        mfuuid      # Media Foundation UUIDs
+        strmiids    # DirectShow
+    )
+    
+    if(MINGW)
+        # MinGW specific
+        list(APPEND FFMPEG_LIBRARIES pthread)
+        
+        # Create compatibility object for MSVC-built zlib
+        # This provides __security_cookie and related symbols
+        set(COMPAT_SRC "${CMAKE_BINARY_DIR}/msvc_compat.c")
+        if(NOT EXISTS ${COMPAT_SRC})
+            file(WRITE ${COMPAT_SRC} "
+#include <stdlib.h>
+
+// Compatibility stubs for MSVC runtime functions
+void* __security_cookie = (void*)0xDEADBEEF;
+void __security_check_cookie(void* cookie) { (void)cookie; }
+void __GSHandlerCheck() {}
+void __report_rangecheckfailure() { exit(1); }
+")
+        endif()
+        add_library(msvc_compat STATIC ${COMPAT_SRC})
+        list(APPEND FFMPEG_LIBRARIES msvc_compat)
+    endif()
+elseif(UNIX AND NOT APPLE)
+    # Linux dependencies
+    list(APPEND FFMPEG_LIBRARIES 
+        pthread
+        m          # Math library
+        dl         # Dynamic linking
+    )
+    
+    # Optional: Check for additional codec dependencies
+    find_library(LZMA_LIB lzma)
+    if(LZMA_LIB)
+        list(APPEND FFMPEG_LIBRARIES ${LZMA_LIB})
+    endif()
+    
+    find_library(BZ2_LIB bz2)
+    if(BZ2_LIB)
+        list(APPEND FFMPEG_LIBRARIES ${BZ2_LIB})
+    endif()
+elseif(APPLE)
+    # macOS dependencies
+    list(APPEND FFMPEG_LIBRARIES 
+        pthread
+        m
+        "-framework CoreFoundation"
+        "-framework CoreVideo"
+        "-framework CoreMedia"
+        "-framework VideoToolbox"
+    )
+endif()
+
+# ============================================================================
+# Setup stb_image
+# ============================================================================
+set(STB_IMAGE_DIR "${CMAKE_SOURCE_DIR}/3rd_party/stb_image")
+if(NOT EXISTS "${STB_IMAGE_DIR}/stb_image.h")
+    message(WARNING "stb_image.h not found at ${STB_IMAGE_DIR}")
+endif()
+
+# ============================================================================
+# Main executable
+# ============================================================================
+file(GLOB_RECURSE PROJECT_SOURCES 
+    CONFIGURE_DEPENDS 
+    ${CMAKE_SOURCE_DIR}/src/*.cpp 
+    ${CMAKE_SOURCE_DIR}/src/*.c
+)
+
+# Exclude test files from main build
+list(FILTER PROJECT_SOURCES EXCLUDE REGEX ".*test_.*\\.cpp$")
+
+if(NOT PROJECT_SOURCES)
+    message(WARNING "No source files found in src/. Creating placeholder main.cpp")
+    file(WRITE ${CMAKE_SOURCE_DIR}/src/main.cpp 
+        "#include <iostream>\nint main() {\n    std::cout << \"ASCII Vid Converter\\n\";\n    return 0;\n}\n")
+    set(PROJECT_SOURCES ${CMAKE_SOURCE_DIR}/src/*.cpp *.h)
+endif()
+
+add_executable(${PROJECT_NAME} ${PROJECT_SOURCES})
+
+target_include_directories(${PROJECT_NAME} PRIVATE
+    ${FFMPEG_INCLUDE_DIRS}
+    ${STB_IMAGE_DIR}
+    ${EXTRA_INCLUDE_DIRS}
+)
+
+target_link_libraries(${PROJECT_NAME} PRIVATE
+    ${FFMPEG_LIBRARIES}
+)
+
+# For static linking, ensure we don't have undefined symbols
+if(NOT BUILD_SHARED_LIBS)
+    if(UNIX AND NOT APPLE)
+        target_link_options(${PROJECT_NAME} PRIVATE -static-libgcc -static-libstdc++)
+    endif()
+endif()
+
+# ============================================================================
+# Test executable (optional)
+# ============================================================================
+set(TEST_SOURCE ${CMAKE_SOURCE_DIR}/src/test_ffmpeg_stb.cpp)
+if(EXISTS ${TEST_SOURCE})
+    add_executable(test_ffmpeg_stb ${TEST_SOURCE})
+    
+    target_include_directories(test_ffmpeg_stb PRIVATE
+        ${FFMPEG_INCLUDE_DIRS}
+        ${STB_IMAGE_DIR}
+        ${EXTRA_INCLUDE_DIRS}
+    )
+    
+    target_link_libraries(test_ffmpeg_stb PRIVATE
+        ${FFMPEG_LIBRARIES}
+    )
+    
+    if(NOT BUILD_SHARED_LIBS AND UNIX AND NOT APPLE)
+        target_link_options(test_ffmpeg_stb PRIVATE -static-libgcc -static-libstdc++)
+    endif()
+    
+    message(STATUS "Added test_ffmpeg_stb target")
+endif()
+
+# ============================================================================
+# Compiler flags
+# ============================================================================
+if(MSVC)
+    target_compile_options(${PROJECT_NAME} PRIVATE 
+        /W4 
+        /permissive-
+        /MT  # Static runtime for MSVC
+    )
+else()
+    target_compile_options(${PROJECT_NAME} PRIVATE 
+        -Wall -Wextra -Wpedantic
+    )
+    if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+        target_compile_options(${PROJECT_NAME} PRIVATE -g)
+    endif()
+endif()
+
+# ============================================================================
+# Summary
+# ============================================================================
+message(STATUS "===========================================")
+message(STATUS "Project:        ${PROJECT_NAME} v${PROJECT_VERSION}")
+message(STATUS "Build type:     ${CMAKE_BUILD_TYPE}")
+message(STATUS "C++ standard:   ${CMAKE_CXX_STANDARD}")
+message(STATUS "Linking:        STATIC")
+message(STATUS "FFmpeg:         ${FFMPEG_INCLUDE_DIRS}")
+message(STATUS "Output dir:     ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
+message(STATUS "===========================================")
